@@ -124,25 +124,69 @@ type HardwareProfileSpec struct {
 
 type DRASpec struct {
     // ResourceClaimTemplateName names a pre-existing ResourceClaimTemplate in the
-    // workload's namespace. Existence is checked by the consuming module's validating
-    // webhook at admission time, not by this CRD's own schema.
+    // workload's namespace. Must be a valid DNS subdomain name (RFC 1123), matching
+    // ResourceClaimTemplate.metadata.name's own naming constraint. Existence (not just
+    // well-formedness) is checked by the consuming module's validating webhook at
+    // admission time, not by this CRD's own schema.
     // +kubebuilder:validation:Required
     // +kubebuilder:validation:MinLength=1
+    // +kubebuilder:validation:MaxLength=253
+    // +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+    ResourceClaimTemplateName string `json:"resourceClaimTemplateName"`
+}
+```
+
+`DRASpec` is mirrored identically into `api/infrastructure/v1alpha1`, matching how `Identifiers`
+and `SchedulingSpec` are already kept in sync across both versions of this CRD today:
+
+```go
+type HardwareProfileSpec struct {
+    Identifiers    []HardwareIdentifier `json:"identifiers,omitempty"`
+    SchedulingSpec *SchedulingSpec      `json:"scheduling,omitempty"`
+
+    // This field is not supported in v1alpha1 and is only present to ensure lossless
+    // round-trip conversions to v1.
+    // +optional
+    DRA *DRASpec `json:"dra,omitempty"`
+}
+
+type DRASpec struct {
+    // +kubebuilder:validation:Required
+    // +kubebuilder:validation:MinLength=1
+    // +kubebuilder:validation:MaxLength=253
+    // +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
     ResourceClaimTemplateName string `json:"resourceClaimTemplateName"`
 }
 ```
 
 Key properties of this shape:
 
-* **No CRD version bump.** `v1` is already the storage/hub version; `v1alpha1` uses CRD conversion
-  strategy `None` with no `Hub`/`ConvertTo` webhook code for this CRD, so a `v1`-only optional
-  field is simply invisible to `v1alpha1` clients and never lost from storage.
+* **No CRD version bump; field mirrored into both served versions.** `v1` is the storage/hub
+  version, and `v1alpha1` is deprecated but still served with CRD conversion strategy `None` (no
+  `Hub`/`ConvertTo` webhook code for this CRD). Under `None`, a field defined only in `v1` would
+  be pruned from a `v1alpha1` client's `GET` and could be lost on a subsequent read-modify-write
+  through `v1alpha1` — the same class of problem `DataScienceCluster` solves between its
+  `v1`/`v2` versions via a real conversion webhook and an annotation-stash for version-only
+  fields (`api/datasciencecluster/v1/datasciencecluster_conversion.go`). That machinery is
+  unnecessary here: `DRASpec` is defined identically in `v1alpha1.HardwareProfileSpec` (unused by
+  any `v1alpha1` code path, present only so `None` conversion round-trips losslessly), so no
+  conversion webhook is needed. The existing `TestHardwareProfileAPIConversion` round-trip test
+  (`internal/webhook/hardwareprofile/conversion_integration_test.go`) is extended to cover a
+  profile with `dra` set round-tripping through both versions.
 * **Purely additive.** Existing `HardwareProfile` objects behave identically forever; no code path
   today reads this field.
 * **No new webhook validation on `HardwareProfile` itself.** The one field needs no CEL
   discriminator today, consistent with the project's preference for CEL-based validation
   (`+kubebuilder:validation:XValidation`) over new admission Go code, the same pattern
   `SchedulingSpec` already uses for its Queue/Node discriminator.
+* **Name format is validated by the CRD schema; existence is not.** `ResourceClaimTemplateName`
+  carries `MaxLength=253` and a DNS-1123-subdomain `Pattern`, matching the same naming constraint
+  Kubernetes enforces on `ResourceClaimTemplate.metadata.name` itself. `MinLength=1` alone would
+  accept malformed values (e.g. uppercase characters, embedded `/`, over-length strings) that can
+  never resolve to a real object, silently deferring that failure to the consuming module's
+  admission webhook. Rejecting malformed names at the CRD-schema level is plain kubebuilder
+  validation, not new Go code, and is orthogonal to the existence check in "Guardrail" below,
+  which still requires a live cluster lookup.
 * **`DRASpec` is a struct, not a bare field**, specifically so an inline, generated-request shape
   (see "Alternatives") could be added later as an additional optional field on the same struct
   without an API version bump or breaking change.
@@ -211,6 +255,25 @@ Support both shapes on `DRASpec`, enforced mutually exclusive via CEL
   design, so it doesn't avoid the guardrail work; it only adds the inline option's cost on top.
   Since users can already bypass `HardwareProfile` and hand-write `PodSpec.resourceClaims` for
   complex cases, the added reference escape hatch is largely redundant.
+
+### Conversion webhook instead of a mirrored v1alpha1 field
+
+Instead of defining `DRASpec` identically in both `v1` and `v1alpha1`, `HardwareProfile` could
+adopt the same versioning mechanism `DataScienceCluster` uses between its `v1` and `v2`: promote
+`v1` to a `Hub`, implement `ConvertTo`/`ConvertFrom` on `v1alpha1`, patch the CRD to
+`spec.conversion.strategy: Webhook`, and stash the `v1`-only `dra` value in an annotation during
+down-conversion so it survives a round trip through `v1alpha1` (restoring it on up-conversion),
+mirroring `api/datasciencecluster/v1/datasciencecluster_conversion.go`'s handling of `v2`-only
+sub-component state.
+
+* **Pro**: The general-purpose, textbook-correct pattern for a field that truly cannot be
+  expressed in an older version's schema.
+* **Con**: Requires standing up conversion-webhook infrastructure (webhook serving, RBAC, CRD
+  patch) that doesn't exist for this CRD today, solely to protect a deprecated, no-longer-written
+  API version. Unnecessary here because `DRASpec` is trivially expressible in `v1alpha1` too —
+  mirroring the field is strictly simpler and keeps `None` conversion safe, which is why it was
+  chosen instead. Kept here as the fallback pattern if a future `HardwareProfile` field genuinely
+  can't be mirrored (e.g., a type only `v1`'s dependencies can express).
 
 ### Why reference-only was chosen over both alternatives
 
