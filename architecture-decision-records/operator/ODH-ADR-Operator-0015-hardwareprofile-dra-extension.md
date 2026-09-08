@@ -210,6 +210,28 @@ Pod into an immediate, clear admission rejection. Implementing this is out of sc
 (API-only) and is called out here because it materially informed the schema decision (see
 "Risks").
 
+### Behavior when the referenced template changes
+
+Neither this ADR nor the consuming modules' planned guardrail adds any reconciliation loop that
+re-checks a `HardwareProfile`'s DRA reference after admission. "Changes" after admission fall into
+two cases, both of which behave the same way existing `HardwareProfile` fields already do today:
+
+* **The `HardwareProfile`'s `dra.resourceClaimTemplateName` is edited or removed.** The consuming
+  module's mutating webhook (workbenches-operator for `Notebook`, odh-model-controller for
+  `InferenceService`/`LLMInferenceService`) only reads a profile at the workload's admission time,
+  exactly like it does today for `Identifiers` and `SchedulingSpec`. Editing an already-referenced
+  profile has no retroactive effect on already-admitted workloads; it only takes effect on the next
+  workload created (or recreated) against that profile.
+* **The referenced `ResourceClaimTemplate`'s content is mutated in place.** This follows stock
+  Kubernetes DRA semantics, not anything opendatahub-operator-family code decides: a
+  `ResourceClaimTemplate` generates a `ResourceClaim` once, at Pod creation. Editing the template
+  afterward does not retroactively change any `ResourceClaim` already generated from it; only Pods
+  created after the edit pick up the new content.
+
+In both cases, the only thing this design (and the planned guardrail) checks is existence of the
+named `ResourceClaimTemplate` at the moment the workload is admitted — not whether it later
+changes or disappears. See "Coverage gap" in "Risks" for the resulting gap.
+
 ### Feature maturity
 
 `HardwareProfile` itself is GA. This DRA extension ships as **Tech Preview** only: the guardrail
@@ -296,18 +318,34 @@ sub-component state.
 * This ADR introduces no new RBAC, credentials, or cross-namespace read access in
   opendatahub-operator itself; `HardwareProfile` remains namespace-scoped and the new field is a
   plain string name, not a live reference resolved by this repo's code.
+* **Trust model for cross-namespace-shared profiles.** A shared `HardwareProfile` assumes whoever
+  creates the same-named `ResourceClaimTemplate` in each referencing namespace matches the
+  profile author's intent (device class, quantities, etc.); there's no allow-list letting the
+  profile owner restrict which namespaces may do so, unlike `ClusterQueue.spec.namespaceSelector`
+  for this CRD's own `SchedulingSpec.Kueue` field. In practice this is low-stakes: the referenced
+  `ResourceClaimTemplate` always lives in, and only ever affects, the workload's own namespace
+  (never read cross-namespace), and Kubernetes 1.33+ already grants the default namespace `edit`
+  role — the same access a user needs to run any workload — full create/update/delete on
+  `ResourceClaimTemplate`. So this adds no new capability; anyone who could exploit a mismatched
+  template could equally hand-write `PodSpec.resourceClaims` directly, bypassing `HardwareProfile`
+  entirely. The realistic failure mode is a namespace's DRA behavior quietly drifting from what the
+  shared profile intended — a correctness/support cost (see "Operational burden" below), not a
+  security exposure — and doesn't warrant a `namespaceSelector`-style gate at this stage.
 
 ## Risks
 
 * **Coverage gap**: the planned validating-webhook guardrail (owned by workbenches-operator and
   odh-model-controller, out of scope here) only checks template existence at admission time, not
-  after. A template deleted post-admission but pre-scheduling still results in a stuck Pod. This is
-  the primary reason the overall feature ships as Tech Preview.
+  after. A template deleted, mutated, or repointed post-admission but pre-scheduling still results
+  in a stuck Pod (or a Pod scheduled against a claim different from what was reviewed at admission
+  time — see "Behavior when the referenced template changes"). This is the primary reason the
+  overall feature ships as Tech Preview.
 * **Operational burden**: a shared `HardwareProfile` referenced from many namespaces
   (`opendatahub.io/hardware-profile-namespace`) requires the same-named `ResourceClaimTemplate` to
   be separately pre-created in every one of those namespaces, by whoever authors it out-of-band.
-  This burden is inherent to the reference-only design and does not go away with the guardrail; the
-  guardrail only makes the failure loud instead of silent.
+  This burden is inherent to the reference-only design and does not go away with the guardrail;
+  the guardrail only makes the failure loud instead of silent. See "Security and Privacy
+  Considerations" for the related (low-stakes) trust model.
 * **Dependency on out-of-scope work**: the value of this API change is fully realized only once
   workbenches-operator and odh-model-controller implement the consuming webhook logic and the
   guardrail. Shipping the API ahead of that work is intentional (per RHOAIENG-87978's scope) but
